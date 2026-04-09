@@ -1,0 +1,16 @@
+# Build artifacts
+hls-load-tester
+*.exe
+*.dll
+*.so
+
+# Editor / OS
+.DS_Store
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local test files
+*.log
+events.ndjson
