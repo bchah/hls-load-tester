@@ -1,4 +1,4 @@
-module github.com/streamwell/hls-load-tester
+module github.com/bchah/hls-load-tester
 
 go 1.26.1
 

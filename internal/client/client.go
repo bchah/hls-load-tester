@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/streamwell/hls-load-tester/internal/m3u8"
-	"github.com/streamwell/hls-load-tester/internal/metrics"
+	"github.com/bchah/hls-load-tester/internal/m3u8"
+	"github.com/bchah/hls-load-tester/internal/metrics"
 )
 
 // Client simulates a single HLS viewer session.

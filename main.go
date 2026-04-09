@@ -9,9 +9,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/streamwell/hls-load-tester/internal/client"
-	"github.com/streamwell/hls-load-tester/internal/metrics"
-	"github.com/streamwell/hls-load-tester/internal/reporter"
+	"github.com/bchah/hls-load-tester/internal/client"
+	"github.com/bchah/hls-load-tester/internal/metrics"
+	"github.com/bchah/hls-load-tester/internal/reporter"
 )
 
 // version is set at build time via -ldflags.

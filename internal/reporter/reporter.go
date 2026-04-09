@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/streamwell/hls-load-tester/internal/metrics"
+	"github.com/bchah/hls-load-tester/internal/metrics"
 )
 
 const dashboardLines = 13 // number of lines the dashboard occupies
