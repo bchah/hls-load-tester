@@ -80,11 +80,19 @@ func (c *Client) Run(ctx context.Context) {
 		return
 	}
 
-	if pl.ServerControl.CanBlockReload {
+	if pl.ServerControl.CanBlockReload && !c.cfg.NoBlockingReload {
 		c.runLLHLS(ctx, mediaURL, pl, mpr.Age)
 	} else {
 		c.runLive(ctx, mediaURL, pl)
 	}
+}
+
+// Close releases resources tied to this virtual client.
+func (c *Client) Close() {
+	if c == nil || c.dl == nil {
+		return
+	}
+	c.dl.Close()
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -131,6 +139,9 @@ func (c *Client) runLive(ctx context.Context, mediaURL string, pl *m3u8.MediaPla
 		if ctx.Err() != nil {
 			return
 		}
+		if !seg.IsComplete || seg.URI == "" {
+			continue
+		}
 		if seg.MapURI != "" && seg.MapURI != lastMapURI {
 			c.fetchSegment(ctx, seg.MapURI, metrics.KindSegment)
 			lastMapURI = seg.MapURI
@@ -173,6 +184,10 @@ func (c *Client) runLive(ctx context.Context, mediaURL string, pl *m3u8.MediaPla
 
 		newPL, err := m3u8.ParseMedia(mediaURL, mpr.Body, prev)
 		if err != nil {
+			retryWait := secondsToDuration(prev.TargetDuration / 2)
+			if !sleepWithContext(ctx, retryWait) {
+				return
+			}
 			continue
 		}
 		prev = newPL
@@ -181,6 +196,9 @@ func (c *Client) runLive(ctx context.Context, mediaURL string, pl *m3u8.MediaPla
 		// Download segments that are new since last download.
 		for _, seg := range pl.Segments {
 			if seg.MSN <= lastDownloadedMSN {
+				continue
+			}
+			if !seg.IsComplete || seg.URI == "" {
 				continue
 			}
 			if ctx.Err() != nil {
@@ -330,8 +348,12 @@ func (c *Client) runLLHLS(ctx context.Context, mediaURL string, pl *m3u8.MediaPl
 		newPL, err := m3u8.ParseMedia(mediaURL, mpr.Body, prev)
 		if err != nil {
 			<-hintDone
+			if !sleepWithContext(ctx, secondsToDuration(partTarget/2)) {
+				return
+			}
 			continue
 		}
+		playlistAdvanced := hasPlaylistAdvanced(pl, newPL)
 		prev = newPL
 
 		// Wait for hint to finish before we process the new playlist.
@@ -392,6 +414,14 @@ func (c *Client) runLLHLS(ctx context.Context, mediaURL string, pl *m3u8.MediaPl
 
 		pl = newPL
 
+		// Some origins may return immediately for blocking requests when there is
+		// no new media yet; pace retries to avoid over-polling the playlist.
+		if !playlistAdvanced {
+			if !sleepWithContext(ctx, secondsToDuration(partTarget/2)) {
+				return
+			}
+		}
+
 		if pl.HasEndList {
 			return
 		}
@@ -420,6 +450,72 @@ func computeNextBlockingTarget(pl *m3u8.MediaPlaylist, lastMSN, lastPart int) (i
 	}
 	// Last thing was a part — request the next part.
 	return lastMSN, lastPart + 1
+}
+
+func hasPlaylistAdvanced(prev, next *m3u8.MediaPlaylist) bool {
+	if prev == nil || next == nil {
+		return true
+	}
+	if next.MediaSequence != prev.MediaSequence {
+		return true
+	}
+
+	prevMSN := prev.LastMSN()
+	nextMSN := next.LastMSN()
+	if nextMSN != prevMSN {
+		return true
+	}
+
+	prevLastPart := prev.LastPart()
+	nextLastPart := next.LastPart()
+	prevPart := -1
+	nextPart := -1
+	prevPartMSN := -1
+	nextPartMSN := -1
+	if prevLastPart != nil {
+		prevPart = prevLastPart.PartIndex
+		prevPartMSN = prevLastPart.MSN
+	}
+	if nextLastPart != nil {
+		nextPart = nextLastPart.PartIndex
+		nextPartMSN = nextLastPart.MSN
+	}
+	if nextPartMSN != prevPartMSN || nextPart != prevPart {
+		return true
+	}
+
+	prevHint := ""
+	nextHint := ""
+	if prev.PreloadHint != nil && prev.PreloadHint.Type == "PART" {
+		prevHint = prev.PreloadHint.URI
+	}
+	if next.PreloadHint != nil && next.PreloadHint.Type == "PART" {
+		nextHint = next.PreloadHint.URI
+	}
+	return nextHint != prevHint
+}
+
+func secondsToDuration(seconds float64) time.Duration {
+	if seconds <= 0 {
+		return 500 * time.Millisecond
+	}
+	d := time.Duration(seconds * float64(time.Second))
+	if d <= 0 {
+		return 500 * time.Millisecond
+	}
+	return d
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		d = 500 * time.Millisecond
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(d):
+		return true
+	}
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -560,6 +656,7 @@ func RunAll(ctx context.Context, cfg *Config, n int, rampUp time.Duration, colle
 			defer wg.Done()
 			defer collector.DecActive()
 			cl := newClient(clientID, cfg, collector)
+			defer cl.Close()
 			cl.Run(ctx)
 		}(id)
 	}

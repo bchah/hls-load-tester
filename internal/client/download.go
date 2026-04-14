@@ -18,14 +18,17 @@ import (
 // connections are not shared across simulated viewers.
 type Downloader struct {
 	hc        *http.Client
+	transport *http.Transport
 	userAgent string
 }
 
 // newTransport builds an http.Transport. If useHTTP2 is true, HTTP/2 is
 // negotiated via ALPN on TLS connections.
-func newTransport(useHTTP2 bool) http.RoundTripper {
+func newTransport(useHTTP2 bool) *http.Transport {
 	t := &http.Transport{
+		MaxIdleConns:          2,
 		MaxIdleConnsPerHost:   2,
+		MaxConnsPerHost:       2,
 		IdleConnTimeout:       30 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
@@ -42,13 +45,23 @@ func newTransport(useHTTP2 bool) http.RoundTripper {
 
 // NewDownloader creates a Downloader for one virtual client.
 func NewDownloader(cfg *Config) *Downloader {
+	transport := newTransport(!cfg.NoHTTP2)
 	return &Downloader{
 		hc: &http.Client{
-			Transport: newTransport(!cfg.NoHTTP2),
+			Transport: transport,
 			Timeout:   cfg.Timeout,
 		},
+		transport: transport,
 		userAgent: cfg.UserAgent,
 	}
+}
+
+// Close closes idle keep-alive connections held by this downloader.
+func (d *Downloader) Close() {
+	if d == nil || d.transport == nil {
+		return
+	}
+	d.transport.CloseIdleConnections()
 }
 
 // PlaylistResult holds the outcome of a playlist fetch.

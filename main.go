@@ -117,14 +117,14 @@ func main() {
 // ─── CLI parsing ──────────────────────────────────────────────────────────────
 
 type options struct {
-	clients        int
-	duration       time.Duration
-	rampUp         time.Duration
-	interval       time.Duration
-	logFile        string
-	slowThreshold  float64 // milliseconds
-	showVersion    bool
-	showHelp       bool
+	clients       int
+	duration      time.Duration
+	rampUp        time.Duration
+	interval      time.Duration
+	logFile       string
+	slowThreshold float64 // milliseconds
+	showVersion   bool
+	showHelp      bool
 }
 
 // parseFlags does minimal flag parsing without importing flag or cobra.
@@ -208,6 +208,8 @@ func parseFlags() (*client.Config, *options, error) {
 			cfg.UserAgent = args[i]
 		case "--no-http2":
 			cfg.NoHTTP2 = true
+		case "--no-blocking-reload":
+			cfg.NoBlockingReload = true
 		case "--interval":
 			i++
 			if i >= len(args) {
@@ -265,6 +267,7 @@ Flags:
   -t, --timeout <duration>   Per-request HTTP timeout (default: 10s)
       --ua <string>          User-Agent header (default: hls-load-tester/dev)
       --no-http2             Disable HTTP/2
+      --no-blocking-reload   Disable LL-HLS blocking chunklist reload
       --interval <duration>  Dashboard refresh interval (default: 2s)
       --log <file>           Write NDJSON event log to file
       --slow-requests-threshold <duration>  Request duration threshold for slow count (default: 2000ms)

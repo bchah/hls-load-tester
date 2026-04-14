@@ -1,6 +1,6 @@
 # hls-load-tester
 
-Simulate concurrent HLS/LL-HLS viewers against a streaming origin or CDN.
+Simulate concurrent HLS/LL-HLS viewers against a streaming origin or CDN. Requires Golang.
 
 ## Installation
 
@@ -35,6 +35,7 @@ hls-load-tester [flags] <url>
 | `-t`, `--timeout` | `10s` | Per-request HTTP timeout |
 | `--ua` | `hls-load-tester/dev` | `User-Agent` header value |
 | `--no-http2` | — | Force HTTP/1.1 |
+| `--no-blocking-reload` | — | Disable LL-HLS blocking chunklist reload and use periodic reload |
 | `--interval` | `2s` | Dashboard refresh interval |
 | `--log` | — | Write per-request NDJSON event log to a file |
 | `--slow-requests-threshold` | `2000ms` | Latency above which a request is counted as slow |
@@ -66,6 +67,11 @@ hls-load-tester -c 200 -d 10m --log events.ndjson https://example.com/live/strea
 **Force HTTP/1.1 (e.g. to test origin without HTTP/2):**
 ```sh
 hls-load-tester -c 50 --no-http2 https://example.com/live/stream.m3u8
+```
+
+**Reduce chunklist request rate for LL-HLS (browser-like periodic reload):**
+```sh
+hls-load-tester -c 50 --no-blocking-reload https://example.com/live/stream.m3u8
 ```
 
 ## Live Dashboard
