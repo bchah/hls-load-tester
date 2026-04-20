@@ -139,8 +139,8 @@ func parseFlags() (*client.Config, *options, error) {
 	opts := &options{
 		clients:       10,
 		duration:      60 * time.Second,
-		interval:      2 * time.Second,
-		slowThreshold: 2000.0,
+		interval:      1 * time.Second,
+		slowThreshold: 4000.0,
 	}
 
 	positional := []string{}

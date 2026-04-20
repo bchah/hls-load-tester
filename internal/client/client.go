@@ -291,27 +291,26 @@ func (c *Client) runLLHLS(ctx context.Context, mediaURL string, pl *m3u8.MediaPl
 		if pl.PreloadHint != nil && pl.PreloadHint.Type == "PART" {
 			hintURI = pl.PreloadHint.URI
 			go func() {
-				defer close(hintDone)
-				res, err := c.dl.FetchSegment(ctx, hintURI)
-				hintMu.Lock()
-				hintResult = res
-				hintMu.Unlock()
-				if err != nil {
-					c.emitErr(metrics.KindPart, err)
-					return
-				}
-				if res != nil {
-					c.collector.Emit(metrics.Event{
-						Kind:       metrics.KindPart,
-						ClientID:   c.id,
-						Latency:    res.Latency,
-						TTFB:       res.TTFB,
-						Bytes:      res.Bytes,
-						HTTPStatus: res.StatusCode,
-						Timestamp:  time.Now(),
-					})
-				}
-			}()
+    defer close(hintDone)
+    res, err := c.dl.FetchSegment(ctx, hintURI)
+    hintMu.Lock()
+    hintResult = res
+    hintMu.Unlock()
+    if err != nil {
+        return // let the main loop retry and emit
+    }
+    if res != nil {
+        c.collector.Emit(metrics.Event{
+            Kind:       metrics.KindPart,
+            ClientID:   c.id,
+            Latency:    res.Latency,
+            TTFB:       res.TTFB,
+            Bytes:      res.Bytes,
+            HTTPStatus: res.StatusCode,
+            Timestamp:  time.Now(),
+        })
+    }
+}()
 		} else {
 			close(hintDone)
 		}
