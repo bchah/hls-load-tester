@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -26,9 +27,9 @@ type Downloader struct {
 // negotiated via ALPN on TLS connections.
 func newTransport(useHTTP2 bool) *http.Transport {
 	t := &http.Transport{
-		MaxIdleConns:          2,
-		MaxIdleConnsPerHost:   2,
-		MaxConnsPerHost:       2,
+		MaxIdleConns:          4,
+		MaxIdleConnsPerHost:   4,
+		MaxConnsPerHost:       4,
 		IdleConnTimeout:       30 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
@@ -97,11 +98,18 @@ func (d *Downloader) FetchPlaylist(ctx context.Context, rawURL string, params ma
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusNoContent {
+			io.Copy(io.Discard, resp.Body) //nolint:errcheck
+			return &PlaylistResult{
+				StatusCode: resp.StatusCode,
+				Latency:    latency,
+			}, nil
+		}
 		io.Copy(io.Discard, resp.Body) //nolint:errcheck
 		return &PlaylistResult{
 			StatusCode: resp.StatusCode,
 			Latency:    latency,
-		}, fmt.Errorf("HTTP %d", resp.StatusCode)
+		}, fmt.Errorf("HTTP %d: %s", resp.StatusCode, u)
 	}
 
 	// Decompress gzip if the server sent it.
@@ -167,7 +175,7 @@ func (d *Downloader) FetchSegment(ctx context.Context, segURL string) (*SegmentR
 			StatusCode: resp.StatusCode,
 			TTFB:       ttfb,
 			Latency:    ttfb,
-		}, fmt.Errorf("HTTP %d", resp.StatusCode)
+		}, fmt.Errorf("HTTP %d: %s", resp.StatusCode, segURL)
 	}
 
 	n, err := io.Copy(io.Discard, resp.Body)
@@ -200,8 +208,14 @@ func buildURL(rawURL string, params map[string]string) (string, error) {
 	}
 	var sb strings.Builder
 	sb.WriteString(rawURL)
+	keys := make([]string, 0, len(params))
+	for k := range params {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
 	first := true
-	for k, v := range params {
+	for _, k := range keys {
+		v := params[k]
 		if first {
 			sb.WriteString(sep)
 			first = false

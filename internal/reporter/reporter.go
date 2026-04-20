@@ -13,19 +13,18 @@ const dashboardLines = 13 // number of lines the dashboard occupies
 
 // Reporter renders live stats to a terminal using ANSI cursor control.
 type Reporter struct {
-	collector      *metrics.Collector
-	out            io.Writer
-	url            string
-	totalClients   int
-	duration       time.Duration // 0 = infinite
-	startedAt      time.Time
-	interval       time.Duration
-	slowThreshold  float64 // milliseconds
-	prevStats      metrics.Stats
-	prevTime       time.Time
-	stopCh         chan struct{}
-	doneCh         chan struct{}
-	firstDraw      bool
+	collector    *metrics.Collector
+	out          io.Writer
+	url          string
+	totalClients int
+	duration     time.Duration // 0 = infinite
+	startedAt    time.Time
+	interval     time.Duration
+	prevStats    metrics.Stats
+	prevTime     time.Time
+	stopCh       chan struct{}
+	doneCh       chan struct{}
+	firstDraw    bool
 }
 
 // New creates a Reporter. Call Start() to begin rendering.
@@ -36,20 +35,18 @@ func New(
 	totalClients int,
 	duration time.Duration,
 	interval time.Duration,
-	slowThresholdMS float64,
 ) *Reporter {
 	return &Reporter{
-		collector:     collector,
-		out:           out,
-		url:           url,
-		totalClients:  totalClients,
-		duration:      duration,
-		startedAt:     time.Now(),
-		interval:      interval,
-		slowThreshold: slowThresholdMS,
-		stopCh:        make(chan struct{}),
-		doneCh:        make(chan struct{}),
-		firstDraw:     true,
+		collector:    collector,
+		out:          out,
+		url:          url,
+		totalClients: totalClients,
+		duration:     duration,
+		startedAt:    time.Now(),
+		interval:     interval,
+		stopCh:       make(chan struct{}),
+		doneCh:       make(chan struct{}),
+		firstDraw:    true,
 	}
 }
 
@@ -179,6 +176,7 @@ func line(w io.Writer, char string, width int) {
 
 // printKindRow writes a two-line stats section for one request kind.
 func (r *Reporter) printKindRow(w io.Writer, label string, kind metrics.EventKind, rs metrics.RequestStats) {
+	_ = kind
 	totalMB := float64(rs.Bytes) / 1e6
 	unit := "MB"
 	totalVal := totalMB
@@ -189,22 +187,12 @@ func (r *Reporter) printKindRow(w io.Writer, label string, kind metrics.EventKin
 
 	fmt.Fprintf(w, "  %s  Fetched: %7d  Errors: %4d (%5.2f%%)  Total: %6.1f %s\n",
 		label, rs.Count, rs.ErrCount, rs.ErrPct, totalVal, unit)
-	
-	// Compute slow requests for this kind.
-	slowCount := r.collector.CountAbove(kind, r.slowThreshold)
-	slowPct := 0.0
-	if rs.Count > 0 {
-		slowPct = float64(slowCount) / float64(rs.Count) * 100
-	}
-	
-	fmt.Fprintf(w, "  %s  Slow Requests (>%dms): %6d (%5.2f%%)  Now: %6.1f Mbps\n",
-		strings.Repeat(" ", len(label)),
-		int(r.slowThreshold), slowCount, slowPct,
-		rs.ThroughputMbps)
+	fmt.Fprintf(w, "  %s  Now: %6.1f Mbps\n", strings.Repeat(" ", len(label)), rs.ThroughputMbps)
 }
 
 // printKindSummary is the same layout but for the final summary block.
 func (r *Reporter) printKindSummary(w io.Writer, label string, kind metrics.EventKind, rs metrics.RequestStats) {
+	_ = kind
 	totalMB := float64(rs.Bytes) / 1e6
 	unit := "MB"
 	totalVal := totalMB
@@ -214,16 +202,7 @@ func (r *Reporter) printKindSummary(w io.Writer, label string, kind metrics.Even
 	}
 	fmt.Fprintf(w, "  %s  Fetched: %7d  Errors: %4d (%5.2f%%)  Total: %6.1f %s\n",
 		label, rs.Count, rs.ErrCount, rs.ErrPct, totalVal, unit)
-
-	slowCount := r.collector.CountAbove(kind, r.slowThreshold)
-	slowPct := 0.0
-	if rs.Count > 0 {
-		slowPct = float64(slowCount) / float64(rs.Count) * 100
-	}
-	fmt.Fprintf(w, "  %s  Slow Requests (>%dms): %6d (%5.2f%%)  Avg: %6.1f Mbps\n",
-		strings.Repeat(" ", len(label)),
-		int(r.slowThreshold), slowCount, slowPct,
-		rs.ThroughputMbps)
+	fmt.Fprintf(w, "  %s  Avg: %6.1f Mbps\n", strings.Repeat(" ", len(label)), rs.ThroughputMbps)
 	fmt.Fprintln(w)
 }
 

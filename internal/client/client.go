@@ -2,8 +2,10 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"math"
+	"net"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +23,12 @@ type Client struct {
 	collector *metrics.Collector
 }
 
+const (
+	defaultReloadSeconds = 3.0
+	minReloadInterval    = 1 * time.Second
+	maxRetryBackoff      = 4
+)
+
 // newClient constructs one virtual client.
 func newClient(id int, cfg *Config, collector *metrics.Collector) *Client {
 	return &Client{
@@ -36,7 +44,9 @@ func (c *Client) Run(ctx context.Context) {
 	// Step 1 — fetch the top-level URL and decide master vs. media.
 	pr, err := c.dl.FetchPlaylist(ctx, c.cfg.ManifestURL, nil)
 	if err != nil {
-		c.emitErr(metrics.KindPlaylist, err)
+		if shouldReportRequestErr(ctx, err) {
+			c.emitErr(metrics.KindPlaylist, err)
+		}
 		return
 	}
 	c.emitPlaylist(pr)
@@ -63,7 +73,9 @@ func (c *Client) Run(ctx context.Context) {
 	// Step 2 — fetch initial media playlist (tune-in, no blocking params).
 	mpr, err := c.dl.FetchPlaylist(ctx, mediaURL, nil)
 	if err != nil {
-		c.emitErr(metrics.KindPlaylist, err)
+		if shouldReportRequestErr(ctx, err) {
+			c.emitErr(metrics.KindPlaylist, err)
+		}
 		return
 	}
 	c.emitPlaylist(mpr)
@@ -80,8 +92,8 @@ func (c *Client) Run(ctx context.Context) {
 		return
 	}
 
-	if pl.ServerControl.CanBlockReload && !c.cfg.NoBlockingReload {
-		c.runLLHLS(ctx, mediaURL, pl, mpr.Age)
+	if pl.ServerControl.CanBlockReload {
+		c.runLLHLS(ctx, mediaURL, pl)
 	} else {
 		c.runLive(ctx, mediaURL, pl)
 	}
@@ -107,7 +119,7 @@ func (c *Client) runVOD(ctx context.Context, pl *m3u8.MediaPlaylist) {
 		}
 		if seg.MapURI != "" && seg.MapURI != lastMapURI {
 			// Fetch init section once per map change.
-			c.fetchSegment(ctx, seg.MapURI, metrics.KindSegment)
+			c.fetchInit(ctx, seg.MapURI)
 			lastMapURI = seg.MapURI
 		}
 		start := time.Now()
@@ -133,21 +145,40 @@ func (c *Client) runLive(ctx context.Context, mediaURL string, pl *m3u8.MediaPla
 	lastDownloadedMSN := -1
 	var lastMapURI string
 	prev := pl
+	consecutiveFetchErr := 0
+	consecutiveParseErr := 0
 
-	// Download all backlogged segments up to the live edge on first load.
-	for _, seg := range pl.Segments {
-		if ctx.Err() != nil {
-			return
+	if c.cfg.DownloadBacklog {
+		// Optional stress mode: download the full live window at tune-in.
+		for _, seg := range pl.Segments {
+			if ctx.Err() != nil {
+				return
+			}
+			if !seg.IsComplete || seg.URI == "" {
+				continue
+			}
+			if seg.MapURI != "" && seg.MapURI != lastMapURI {
+				c.fetchInit(ctx, seg.MapURI)
+				lastMapURI = seg.MapURI
+			}
+			c.fetchSegment(ctx, seg.URI, metrics.KindSegment)
+			lastDownloadedMSN = seg.MSN
 		}
-		if !seg.IsComplete || seg.URI == "" {
-			continue
+	} else {
+		// Browser-like tune-in: start from the newest complete segment only.
+		for i := len(pl.Segments) - 1; i >= 0; i-- {
+			seg := pl.Segments[i]
+			if !seg.IsComplete || seg.URI == "" {
+				continue
+			}
+			if seg.MapURI != "" {
+				c.fetchInit(ctx, seg.MapURI)
+				lastMapURI = seg.MapURI
+			}
+			c.fetchSegment(ctx, seg.URI, metrics.KindSegment)
+			lastDownloadedMSN = seg.MSN
+			break
 		}
-		if seg.MapURI != "" && seg.MapURI != lastMapURI {
-			c.fetchSegment(ctx, seg.MapURI, metrics.KindSegment)
-			lastMapURI = seg.MapURI
-		}
-		c.fetchSegment(ctx, seg.URI, metrics.KindSegment)
-		lastDownloadedMSN = seg.MSN
 	}
 
 	for {
@@ -156,40 +187,44 @@ func (c *Client) runLive(ctx context.Context, mediaURL string, pl *m3u8.MediaPla
 		}
 
 		// Compute reload wait: last segment duration on success, targetDuration/2 on retry.
-		reloadWait := pl.TargetDuration / 2
+		reloadWait := normalizeReloadDuration(pl.TargetDuration/2, prev.TargetDuration)
 		if len(pl.Segments) > 0 {
 			last := pl.Segments[len(pl.Segments)-1]
 			if last.Duration > 0 {
-				reloadWait = last.Duration
+				reloadWait = normalizeReloadDuration(last.Duration, pl.TargetDuration)
 			}
 		}
-		select {
-		case <-ctx.Done():
+		if !sleepWithContext(ctx, c.withClientJitter(reloadWait)) {
 			return
-		case <-time.After(time.Duration(reloadWait * float64(time.Second))):
 		}
 
 		mpr, err := c.dl.FetchPlaylist(ctx, mediaURL, nil)
 		if err != nil {
-			c.emitErr(metrics.KindPlaylist, err)
-			// On error, wait half target duration before retrying.
-			select {
-			case <-ctx.Done():
+			consecutiveFetchErr++
+			if shouldReportRequestErr(ctx, err) {
+				c.emitErr(metrics.KindPlaylist, err)
+			}
+			retryWait := normalizeReloadDuration(prev.TargetDuration, pl.TargetDuration)
+			retryWait = backoffDuration(retryWait, consecutiveFetchErr-1)
+			if !sleepWithContext(ctx, c.withClientJitter(retryWait)) {
 				return
-			case <-time.After(time.Duration(prev.TargetDuration / 2 * float64(time.Second))):
 			}
 			continue
 		}
+		consecutiveFetchErr = 0
 		c.emitPlaylist(mpr)
 
 		newPL, err := m3u8.ParseMedia(mediaURL, mpr.Body, prev)
 		if err != nil {
-			retryWait := secondsToDuration(prev.TargetDuration / 2)
-			if !sleepWithContext(ctx, retryWait) {
+			consecutiveParseErr++
+			retryWait := normalizeReloadDuration(prev.TargetDuration, pl.TargetDuration)
+			retryWait = backoffDuration(retryWait, consecutiveParseErr-1)
+			if !sleepWithContext(ctx, c.withClientJitter(retryWait)) {
 				return
 			}
 			continue
 		}
+		consecutiveParseErr = 0
 		prev = newPL
 		pl = newPL
 
@@ -205,7 +240,7 @@ func (c *Client) runLive(ctx context.Context, mediaURL string, pl *m3u8.MediaPla
 				return
 			}
 			if seg.MapURI != "" && seg.MapURI != lastMapURI {
-				c.fetchSegment(ctx, seg.MapURI, metrics.KindSegment)
+				c.fetchInit(ctx, seg.MapURI)
 				lastMapURI = seg.MapURI
 			}
 			c.fetchSegment(ctx, seg.URI, metrics.KindSegment)
@@ -222,45 +257,42 @@ func (c *Client) runLive(ctx context.Context, mediaURL string, pl *m3u8.MediaPla
 // LL-HLS loop (blocking playlist reload)
 // ──────────────────────────────────────────────────────────────────────────────
 
-func (c *Client) runLLHLS(ctx context.Context, mediaURL string, pl *m3u8.MediaPlaylist, initialAge float64) {
+func (c *Client) runLLHLS(ctx context.Context, mediaURL string, pl *m3u8.MediaPlaylist) {
 	var lastMapURI string
 	prev := pl
+	consecutiveBlockingErr := 0
+	consecutiveParseErr := 0
+	consecutiveNoAdvance := 0
 
 	// Tune-in: if Age >= PartTarget, we may need to advance the blocking target.
 	partTarget := pl.PartInf.PartTarget
 	if partTarget <= 0 {
-		partTarget = 1.0 // fallback
+		partTarget = pl.TargetDuration
+	}
+	if partTarget <= 0 {
+		partTarget = defaultReloadSeconds
 	}
 
-	// Seek to the live edge — do NOT download the full window backlog.
-	lastDownloadedMSN := -1
-	lastDownloadedPart := -1
+	// Request cursor for blocking reloads tracks the playlist edge, not download state.
+	nextMSN, nextPart := computeNextBlockingTarget(pl, -1, -1)
 
-	for _, seg := range pl.Segments {
-		// Fetch any new init section exactly once — it is tiny and required.
-		if seg.MapURI != "" && seg.MapURI != lastMapURI {
-			c.fetchSegment(ctx, seg.MapURI, metrics.KindSegment)
+	// Keep lightweight media progress so we only move forward and avoid stale backfill.
+	lastSegmentMSN := -1
+	lastPartMSN := -1
+	lastPartIndex := -1
+
+	// Tune-in: fetch only the newest complete segment once (no backlog).
+	if seg := latestCompleteSegment(pl); seg != nil {
+		if seg.MapURI != "" {
+			c.fetchInit(ctx, seg.MapURI)
 			lastMapURI = seg.MapURI
 		}
-		// Advance position tracker to the live edge without downloading content.
-		if seg.IsComplete {
-			lastDownloadedMSN = seg.MSN
-			lastDownloadedPart = -1
+		if seg.URI != "" {
+			c.fetchSegment(ctx, seg.URI, metrics.KindSegment)
 		}
-		for _, p := range seg.Parts {
-			lastDownloadedMSN = p.MSN
-			lastDownloadedPart = p.PartIndex
-		}
-	}
-
-	// If the playlist advertises a preload hint, count it as already seen so
-	// the blocking loop requests the part after it rather than the hint itself.
-	if pl.PreloadHint != nil && pl.PreloadHint.Type == "PART" {
-		if lastDownloadedPart < 0 {
-			lastDownloadedPart = 0
-		} else {
-			lastDownloadedPart++
-		}
+		lastSegmentMSN = seg.MSN
+		lastPartMSN = seg.MSN
+		lastPartIndex = -1
 	}
 
 	for {
@@ -268,163 +300,159 @@ func (c *Client) runLLHLS(ctx context.Context, mediaURL string, pl *m3u8.MediaPl
 			return
 		}
 
-		// Compute the next blocking request target.
-		nextMSN, nextPart := computeNextBlockingTarget(pl, lastDownloadedMSN, lastDownloadedPart)
-
 		params := map[string]string{
 			"_HLS_msn":  strconv.Itoa(nextMSN),
 			"_HLS_part": strconv.Itoa(nextPart),
 		}
 
-		// Add delta-skip if server supports it and we have a recent enough playlist.
-		if pl.ServerControl.CanSkipUntil > 0 && initialAge < pl.ServerControl.CanSkipUntil/2 {
-			params["_HLS_skip"] = "YES"
-		}
-
-		// Fire preload hint concurrently with the blocking playlist request.
-		var (
-			hintResult *SegmentResult
-			hintDone   = make(chan struct{})
-			hintMu     sync.Mutex
-		)
-		hintURI := ""
-		if pl.PreloadHint != nil && pl.PreloadHint.Type == "PART" {
-			hintURI = pl.PreloadHint.URI
-			go func() {
-    defer close(hintDone)
-    res, err := c.dl.FetchSegment(ctx, hintURI)
-    hintMu.Lock()
-    hintResult = res
-    hintMu.Unlock()
-    if err != nil {
-        return // let the main loop retry and emit
-    }
-    if res != nil {
-        c.collector.Emit(metrics.Event{
-            Kind:       metrics.KindPart,
-            ClientID:   c.id,
-            Latency:    res.Latency,
-            TTFB:       res.TTFB,
-            Bytes:      res.Bytes,
-            HTTPStatus: res.StatusCode,
-            Timestamp:  time.Now(),
-        })
-    }
-}()
-		} else {
-			close(hintDone)
-		}
-
 		// Blocking playlist request.
 		mpr, err := c.dl.FetchPlaylist(ctx, mediaURL, params)
 		if err != nil {
-			c.emitErr(metrics.KindPlaylist, err)
-			<-hintDone
-			// Brief back-off then retry with a plain fetch.
-			select {
-			case <-ctx.Done():
+			consecutiveBlockingErr++
+			if shouldReportRequestErr(ctx, err) {
+				c.emitErr(metrics.KindPlaylist, err)
+			}
+			// Back off and retry blocking reload at the latest known edge.
+			retryWait := normalizeReloadDuration(partTarget, pl.TargetDuration)
+			retryWait = backoffDuration(retryWait, consecutiveBlockingErr-1)
+			if !sleepWithContext(ctx, c.withClientJitter(retryWait)) {
 				return
-			case <-time.After(time.Duration(partTarget * float64(time.Second))):
 			}
-			// Reset with a plain fetch.
-			mpr2, err2 := c.dl.FetchPlaylist(ctx, mediaURL, nil)
-			if err2 != nil {
-				continue
-			}
-			c.emitPlaylist(mpr2)
-			newPL, err2 := m3u8.ParseMedia(mediaURL, mpr2.Body, prev)
-			if err2 != nil {
-				continue
-			}
-			prev = newPL
-			pl = newPL
-			initialAge = math.Max(0, mpr2.Age)
 			continue
 		}
+		consecutiveBlockingErr = 0
 		c.emitPlaylist(mpr)
-		initialAge = math.Max(0, mpr.Age)
+		if mpr.StatusCode == http.StatusNoContent {
+			consecutiveNoAdvance++
+			retryWait := normalizeReloadDuration(partTarget, pl.TargetDuration)
+			retryWait = backoffDuration(retryWait, consecutiveNoAdvance-1)
+			if !sleepWithContext(ctx, c.withClientJitter(retryWait)) {
+				return
+			}
+			continue
+		}
 
 		newPL, err := m3u8.ParseMedia(mediaURL, mpr.Body, prev)
 		if err != nil {
-			<-hintDone
-			if !sleepWithContext(ctx, secondsToDuration(partTarget/2)) {
+			consecutiveParseErr++
+			retryWait := normalizeReloadDuration(partTarget, pl.TargetDuration)
+			retryWait = backoffDuration(retryWait, consecutiveParseErr-1)
+			if !sleepWithContext(ctx, c.withClientJitter(retryWait)) {
 				return
 			}
 			continue
 		}
+		consecutiveParseErr = 0
 		playlistAdvanced := hasPlaylistAdvanced(pl, newPL)
 		prev = newPL
+		pl = newPL
 
-		// Wait for hint to finish before we process the new playlist.
-		<-hintDone
+		// Fetch only newest media to avoid stale part backfill and duplicate requests.
+		if seg := latestCompleteSegment(pl); seg != nil && seg.MSN > lastSegmentMSN {
+			if seg.MapURI != "" && seg.MapURI != lastMapURI {
+				c.fetchInit(ctx, seg.MapURI)
+				lastMapURI = seg.MapURI
+			}
+			// If we already fetched parts for this MSN, skip full segment fetch.
+			if !(lastPartMSN == seg.MSN && lastPartIndex >= 0) && seg.URI != "" {
+				c.fetchSegment(ctx, seg.URI, metrics.KindSegment)
+			}
+			lastSegmentMSN = seg.MSN
+			if lastPartMSN < seg.MSN {
+				lastPartMSN = seg.MSN
+				lastPartIndex = -1
+			}
+		}
 
-		// Download newly available parts and full segments.
-		for _, seg := range newPL.Segments {
-			if seg.IsComplete {
-				if seg.MSN <= lastDownloadedMSN && lastDownloadedPart < 0 {
-					continue // already have this full segment
-				}
-				if seg.MSN < lastDownloadedMSN {
-					continue
-				}
-				// If we already fetched parts of this segment, skip individual part downloads.
-				for _, p := range seg.Parts {
-					if p.MSN < lastDownloadedMSN {
-						continue
+		if tail := latestOpenSegment(pl); tail != nil {
+			if p := latestPart(tail.Parts); p != nil {
+				if p.MSN > lastPartMSN || (p.MSN == lastPartMSN && p.PartIndex > lastPartIndex) {
+					if tail.MapURI != "" && tail.MapURI != lastMapURI {
+						c.fetchInit(ctx, tail.MapURI)
+						lastMapURI = tail.MapURI
 					}
-					if p.MSN == lastDownloadedMSN && p.PartIndex <= lastDownloadedPart {
-						continue
-					}
-					// Skip the part if its URI matches the hint we already fetched.
-					if p.URI != hintURI || hintResult == nil {
-						c.fetchSegment(ctx, p.URI, metrics.KindPart)
-					}
-					lastDownloadedMSN = p.MSN
-					lastDownloadedPart = p.PartIndex
-				}
-				if seg.MapURI != "" && seg.MapURI != lastMapURI {
-					c.fetchSegment(ctx, seg.MapURI, metrics.KindSegment)
-					lastMapURI = seg.MapURI
-				}
-				// Only download the combined segment URI when there are no parts —
-				// if parts exist we already have all the data from them.
-				if seg.URI != "" && len(seg.Parts) == 0 {
-					c.fetchSegment(ctx, seg.URI, metrics.KindSegment)
-				}
-				lastDownloadedMSN = seg.MSN
-				lastDownloadedPart = -1
-			} else {
-				// Partial (in-progress) segment.
-				for _, p := range seg.Parts {
-					if p.MSN < lastDownloadedMSN {
-						continue
-					}
-					if p.MSN == lastDownloadedMSN && p.PartIndex <= lastDownloadedPart {
-						continue
-					}
-					if p.URI != hintURI || hintResult == nil {
-						c.fetchSegment(ctx, p.URI, metrics.KindPart)
-					}
-					lastDownloadedMSN = p.MSN
-					lastDownloadedPart = p.PartIndex
+					c.fetchSegment(ctx, p.URI, metrics.KindPart)
+					lastPartMSN = p.MSN
+					lastPartIndex = p.PartIndex
 				}
 			}
 		}
 
-		pl = newPL
+		nextMSN, nextPart = advanceBlockingTarget(pl, nextMSN, nextPart)
 
 		// Some origins may return immediately for blocking requests when there is
 		// no new media yet; pace retries to avoid over-polling the playlist.
 		if !playlistAdvanced {
-			if !sleepWithContext(ctx, secondsToDuration(partTarget/2)) {
+			consecutiveNoAdvance++
+			retryWait := normalizeReloadDuration(partTarget, pl.TargetDuration)
+			retryWait = backoffDuration(retryWait, consecutiveNoAdvance-1)
+			if !sleepWithContext(ctx, c.withClientJitter(retryWait)) {
 				return
 			}
+		} else {
+			consecutiveNoAdvance = 0
 		}
 
 		if pl.HasEndList {
 			return
 		}
 	}
+}
+
+func latestCompleteSegment(pl *m3u8.MediaPlaylist) *m3u8.Segment {
+	if pl == nil {
+		return nil
+	}
+	for i := len(pl.Segments) - 1; i >= 0; i-- {
+		if pl.Segments[i].IsComplete {
+			return pl.Segments[i]
+		}
+	}
+	return nil
+}
+
+func latestOpenSegment(pl *m3u8.MediaPlaylist) *m3u8.Segment {
+	if pl == nil || len(pl.Segments) == 0 {
+		return nil
+	}
+	last := pl.Segments[len(pl.Segments)-1]
+	if last.IsComplete {
+		return nil
+	}
+	return last
+}
+
+func latestPart(parts []*m3u8.Part) *m3u8.Part {
+	if len(parts) == 0 {
+		return nil
+	}
+	return parts[len(parts)-1]
+}
+
+func advanceBlockingTarget(pl *m3u8.MediaPlaylist, currentMSN, currentPart int) (int, int) {
+	if pl == nil {
+		if currentMSN < 0 {
+			return 0, 0
+		}
+		return currentMSN, currentPart + 1
+	}
+
+	if lp := pl.LastPart(); lp != nil {
+		if lp.MSN > currentMSN || (lp.MSN == currentMSN && lp.PartIndex >= currentPart) {
+			return lp.MSN, lp.PartIndex + 1
+		}
+	}
+
+	if ls := pl.LastMSN(); ls >= 0 {
+		if ls >= currentMSN {
+			return ls + 1, 0
+		}
+	}
+
+	if currentMSN < 0 {
+		return pl.MediaSequence, 0
+	}
+	return currentMSN, currentPart + 1
 }
 
 // computeNextBlockingTarget returns the _HLS_msn and _HLS_part to request next.
@@ -496,18 +524,21 @@ func hasPlaylistAdvanced(prev, next *m3u8.MediaPlaylist) bool {
 
 func secondsToDuration(seconds float64) time.Duration {
 	if seconds <= 0 {
-		return 500 * time.Millisecond
+		return 0
 	}
 	d := time.Duration(seconds * float64(time.Second))
 	if d <= 0 {
-		return 500 * time.Millisecond
+		return 0
+	}
+	if d < minReloadInterval {
+		return minReloadInterval
 	}
 	return d
 }
 
 func sleepWithContext(ctx context.Context, d time.Duration) bool {
 	if d <= 0 {
-		d = 500 * time.Millisecond
+		return true
 	}
 	select {
 	case <-ctx.Done():
@@ -515,6 +546,51 @@ func sleepWithContext(ctx context.Context, d time.Duration) bool {
 	case <-time.After(d):
 		return true
 	}
+}
+
+func normalizeReloadDuration(primarySeconds, fallbackSeconds float64) time.Duration {
+	if d := secondsToDuration(primarySeconds); d > 0 {
+		return d
+	}
+	if d := secondsToDuration(fallbackSeconds); d > 0 {
+		return d
+	}
+	return secondsToDuration(defaultReloadSeconds)
+}
+
+func backoffDuration(base time.Duration, attempt int) time.Duration {
+	if base <= 0 {
+		base = secondsToDuration(defaultReloadSeconds)
+	}
+	if attempt <= 0 {
+		return base
+	}
+
+	factor := 1
+	for i := 0; i < attempt && factor < maxRetryBackoff; i++ {
+		factor *= 2
+	}
+	if factor > maxRetryBackoff {
+		factor = maxRetryBackoff
+	}
+	return time.Duration(factor) * base
+}
+
+func (c *Client) withClientJitter(base time.Duration) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	spread := base / 10 // +/-10% deterministic jitter by client ID
+	if spread <= 0 {
+		return base
+	}
+
+	slot := (c.id % 7) - 3 // range [-3, +3]
+	jittered := base + (time.Duration(slot) * spread / 3)
+	if jittered < minReloadInterval {
+		return minReloadInterval
+	}
+	return jittered
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -527,7 +603,9 @@ func (c *Client) fetchSegment(ctx context.Context, uri string, kind metrics.Even
 	}
 	res, err := c.dl.FetchSegment(ctx, uri)
 	if err != nil {
-		c.emitErr(kind, err)
+		if shouldReportRequestErr(ctx, err) {
+			c.emitErr(kind, err)
+		}
 		return
 	}
 	c.collector.Emit(metrics.Event{
@@ -539,6 +617,18 @@ func (c *Client) fetchSegment(ctx context.Context, uri string, kind metrics.Even
 		HTTPStatus: res.StatusCode,
 		Timestamp:  time.Now(),
 	})
+}
+
+func (c *Client) fetchInit(ctx context.Context, uri string) {
+	if ctx.Err() != nil {
+		return
+	}
+	_, err := c.dl.FetchSegment(ctx, uri)
+	if err != nil {
+		if shouldReportRequestErr(ctx, err) {
+			c.emitErr(metrics.KindSegment, fmt.Errorf("init segment: %w", err))
+		}
+	}
 }
 
 func (c *Client) emitPlaylist(pr *PlaylistResult) {
@@ -559,6 +649,27 @@ func (c *Client) emitErr(kind metrics.EventKind, err error) {
 		Err:       err,
 		Timestamp: time.Now(),
 	})
+}
+
+func shouldReportRequestErr(ctx context.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	if ctx == nil || ctx.Err() == nil {
+		return true
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var nerr net.Error
+	if errors.As(err, &nerr) && nerr.Timeout() {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "context canceled") || strings.Contains(msg, "context deadline exceeded") {
+		return false
+	}
+	return true
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

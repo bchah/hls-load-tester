@@ -3,6 +3,8 @@ hls-load-tester
 *.exe
 *.dll
 *.so
+.gocache
+.gomodcache
 
 # Editor / OS
 .DS_Store

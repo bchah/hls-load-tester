@@ -88,7 +88,7 @@ func main() {
 	collector.Start()
 
 	// Set up reporter.
-	rep := reporter.New(collector, os.Stdout, cfg.ManifestURL, opts.clients, opts.duration, opts.interval, opts.slowThreshold)
+	rep := reporter.New(collector, os.Stdout, cfg.ManifestURL, opts.clients, opts.duration, opts.interval)
 	rep.Start()
 
 	// Launch clients in a goroutine so we can also listen for signals.
@@ -117,14 +117,13 @@ func main() {
 // ─── CLI parsing ──────────────────────────────────────────────────────────────
 
 type options struct {
-	clients       int
-	duration      time.Duration
-	rampUp        time.Duration
-	interval      time.Duration
-	logFile       string
-	slowThreshold float64 // milliseconds
-	showVersion   bool
-	showHelp      bool
+	clients     int
+	duration    time.Duration
+	rampUp      time.Duration
+	interval    time.Duration
+	logFile     string
+	showVersion bool
+	showHelp    bool
 }
 
 // parseFlags does minimal flag parsing without importing flag or cobra.
@@ -133,14 +132,13 @@ func parseFlags() (*client.Config, *options, error) {
 
 	cfg := &client.Config{
 		Rendition: "highest",
-		Timeout:   10 * time.Second,
+		Timeout:   60 * time.Second,
 		UserAgent: "hls-load-tester/" + version,
 	}
 	opts := &options{
-		clients:       10,
-		duration:      60 * time.Second,
-		interval:      1 * time.Second,
-		slowThreshold: 4000.0,
+		clients:  10,
+		duration: 60 * time.Second,
+		interval: 1 * time.Second,
 	}
 
 	positional := []string{}
@@ -208,8 +206,8 @@ func parseFlags() (*client.Config, *options, error) {
 			cfg.UserAgent = args[i]
 		case "--no-http2":
 			cfg.NoHTTP2 = true
-		case "--no-blocking-reload":
-			cfg.NoBlockingReload = true
+		case "--download-backlog":
+			cfg.DownloadBacklog = true
 		case "--interval":
 			i++
 			if i >= len(args) {
@@ -226,16 +224,6 @@ func parseFlags() (*client.Config, *options, error) {
 				return nil, nil, fmt.Errorf("%s requires a value", a)
 			}
 			opts.logFile = args[i]
-		case "--slow-requests-threshold":
-			i++
-			if i >= len(args) {
-				return nil, nil, fmt.Errorf("%s requires a value", a)
-			}
-			d, err := time.ParseDuration(args[i])
-			if err != nil {
-				return nil, nil, fmt.Errorf("--slow-requests-threshold: %w", err)
-			}
-			opts.slowThreshold = float64(d) / float64(time.Millisecond)
 		default:
 			if len(a) > 0 && a[0] == '-' {
 				return nil, nil, fmt.Errorf("unknown flag: %s", a)
@@ -264,19 +252,18 @@ Flags:
   -d, --duration <duration>  Test duration, e.g. 60s, 5m, 0=forever (default: 60s)
   -r, --rendition <mode>     Variant selection: highest | lowest | bw:<bits> (default: highest)
       --ramp-up <duration>   Spread client starts over this duration (default: 0)
-  -t, --timeout <duration>   Per-request HTTP timeout (default: 10s)
+	  -t, --timeout <duration>   Per-request HTTP timeout (default: 60s)
       --ua <string>          User-Agent header (default: hls-load-tester/dev)
       --no-http2             Disable HTTP/2
-      --no-blocking-reload   Disable LL-HLS blocking chunklist reload
+	      --download-backlog     Download entire live window backlog at tune-in
       --interval <duration>  Dashboard refresh interval (default: 2s)
       --log <file>           Write NDJSON event log to file
-      --slow-requests-threshold <duration>  Request duration threshold for slow count (default: 2000ms)
   -h, --help                 Show this help
       --version              Print version
 
 Examples:
   hls-load-tester https://example.com/stream.m3u8
   hls-load-tester -c 50 -d 5m --ramp-up 30s https://example.com/stream.m3u8
-  hls-load-tester -c 10 -r lowest --log events.ndjson --slow-requests-threshold 500ms https://example.com/live.m3u8
+	  hls-load-tester -c 10 -r lowest --log events.ndjson https://example.com/live.m3u8
 `)
 }

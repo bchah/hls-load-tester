@@ -32,13 +32,12 @@ hls-load-tester [flags] <url>
 | `-d`, `--duration` | `60s` | Test duration (`0` = run until interrupted) |
 | `-r`, `--rendition` | `highest` | Variant selection: `highest`, `lowest`, or `bw:<bits>` |
 | `--ramp-up` | `0` | Spread client starts evenly over this duration |
-| `-t`, `--timeout` | `10s` | Per-request HTTP timeout |
+| `-t`, `--timeout` | `60s` | Per-request HTTP timeout |
 | `--ua` | `hls-load-tester/dev` | `User-Agent` header value |
 | `--no-http2` | — | Force HTTP/1.1 |
-| `--no-blocking-reload` | — | Disable LL-HLS blocking chunklist reload and use periodic reload |
+| `--download-backlog` | — | Stress mode: download full live window backlog on tune-in |
 | `--interval` | `2s` | Dashboard refresh interval |
 | `--log` | — | Write per-request NDJSON event log to a file |
-| `--slow-requests-threshold` | `2000ms` | Latency above which a request is counted as slow |
 | `-h`, `--help` | — | Show help |
 | `--version` | — | Print version |
 
@@ -54,9 +53,9 @@ hls-load-tester https://example.com/live/stream.m3u8
 hls-load-tester -c 100 -d 5m --ramp-up 30s https://example.com/live/stream.m3u8
 ```
 
-**Test a specific bitrate rendition, flag requests slower than 500 ms:**
+**Test a specific bitrate rendition:**
 ```sh
-hls-load-tester -c 50 -r bw:4000000 --slow-requests-threshold 500ms https://example.com/live/stream.m3u8
+hls-load-tester -c 50 -r bw:4000000 https://example.com/live/stream.m3u8
 ```
 
 **Capture a full event log for offline analysis:**
@@ -69,9 +68,9 @@ hls-load-tester -c 200 -d 10m --log events.ndjson https://example.com/live/strea
 hls-load-tester -c 50 --no-http2 https://example.com/live/stream.m3u8
 ```
 
-**Reduce chunklist request rate for LL-HLS (browser-like periodic reload):**
+**Enable backlog stress mode in normal live playback:**
 ```sh
-hls-load-tester -c 50 --no-blocking-reload https://example.com/live/stream.m3u8
+hls-load-tester -c 50 --download-backlog https://example.com/live/stream.m3u8
 ```
 
 ## Live Dashboard
@@ -84,13 +83,13 @@ The terminal updates every `--interval` seconds while the test runs:
   Duration: 45s/300s      Clients: 100/100 active   Mode: LL-HLS
 ────────────────────────────────────────────────────────────────────────
   SEGMENTS   Fetched:     100  Errors:    0 ( 0.00%)  Total:    0.1 MB
-             Slow Requests (>2000ms):      0 ( 0.00%)  Now:    0.0 Mbps
+             Now:    0.0 Mbps
 
   PLAYLISTS  Fetched:    8823  Errors:    0 ( 0.00%)  Total:  194.2 MB
-             Slow Requests (>2000ms):      6 ( 0.07%)  Now:   35.1 Mbps
+             Now:   35.1 Mbps
 
   PARTS      Fetched:    8857  Errors:    0 ( 0.00%)  Total:    5.4 GB
-             Slow Requests (>2000ms):      2 ( 0.02%)  Now:  241.3 Mbps
+             Now:  241.3 Mbps
 ────────────────────────────────────────────────────────────────────────
 ```
 
@@ -109,3 +108,4 @@ When `--log` is specified each request is written as a JSON object on its own li
 - For large client counts (>1000), raise the open-file limit first: `ulimit -n 200000`
 - Use `--ramp-up` to avoid a thundering-herd spike on your origin at test start
 - `--rendition lowest` is useful for isolating origin capacity from CDN caching effects
+- For very high concurrency, consider increasing `--timeout` further if you observe client-side `context deadline exceeded` responses

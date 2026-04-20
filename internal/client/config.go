@@ -20,7 +20,8 @@ type Config struct {
 	// NoHTTP2 disables HTTP/2 negotiation.
 	NoHTTP2 bool
 
-	// NoBlockingReload forces non-blocking playlist reload logic even when
-	// EXT-X-SERVER-CONTROL advertises CAN-BLOCK-RELOAD=YES.
-	NoBlockingReload bool
+	// DownloadBacklog makes live mode fetch all segments currently visible in
+	// the initial playlist window at tune-in. Disabled by default for
+	// browser-like behavior.
+	DownloadBacklog bool
 }
